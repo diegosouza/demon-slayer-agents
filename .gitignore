@@ -1,0 +1,6 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# ponytail: runtime state (pi agent files, routing.json, codex profiles) is
+# written under ~/.pi/agent and ~/.codex, so nothing else here is generated.

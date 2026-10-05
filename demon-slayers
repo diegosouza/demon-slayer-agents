@@ -1,0 +1,945 @@
+#!/usr/bin/env python3
+"""demon-slayers — raise the Demon Slayers: one session, two workspaces.
+
+    demon-slayers up             raise the Master
+
+The Master opens in a pane of the `master` workspace, except when `up` runs
+from a shell already inside that workspace: that window becomes the Master, is
+named `master`, and no second pane is opened.
+    demon-slayers task --to <name> --desc <text>   raise one task window
+    demon-slayers status         every task: id, role, state, description
+    demon-slayers info [seat]    every seat's specs (--json to script it)
+    demon-slayers end <task>     close one task's window
+    demon-slayers end-idle       close every idle/done task window
+    demon-slayers attach         attach to the master session
+    demon-slayers down           close the crew
+
+The Master lives in the session that carries a workspace named "master" (yours,
+when you run this from inside tuios). The seats live in the same session, in a
+workspace named "demon-slayers". A **task is a window**: its 8-hex id is the
+window name, its role and description live in the pane's tuios agent meta, and
+its context is its own. The Master's `dispatch` (extensions/slayer.ts, or its
+input router) raises a task per order; `end` and `end-idle` close them. `up`
+registers every seat's MCPs and model metadata but raises only the Master.
+`demon_slayers.py` is the Rule.
+
+DEMON_SLAYERS_DRY=1 prints what would run instead of running it.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import secrets
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.parse
+from pathlib import Path
+
+import demon_slayers
+
+ROOT = Path(__file__).resolve().parent
+DRY = os.environ.get("DEMON_SLAYERS_DRY") == "1"
+
+
+def die(msg: str) -> None:
+    sys.exit(f"demon-slayers: {msg}")
+
+
+def rule() -> dict:
+    return demon_slayers.RULE
+
+
+def run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    print("+", shlex.join(args))
+    if DRY:
+        return subprocess.CompletedProcess(args, 0)
+    return subprocess.run(args, check=check)
+
+
+def inside_tuios() -> bool:
+    return bool(os.environ.get("TUIOS_SESSION"))
+
+
+def cwd(cfg: dict) -> str:
+    p = Path(cfg["session"].get("cwd", "."))
+    return str(p if p.is_absolute() else (ROOT / p).resolve())
+
+
+def model_arg(entry: dict) -> str:
+    """pi takes `provider/model`; the Rule may name the two separately."""
+    provider, model = entry.get("provider", ""), entry.get("model", "")
+    return f"{provider}/{model}" if provider and model else model
+
+
+# What pi may load beside the Rule. Global skills and extensions are never
+# discovered: `--no-skills` and `--no-extensions` switch discovery off, and an
+# explicit `--skill`/`--extension` still loads. builtin:mcp is the crows'
+# transport and must stay; pi-llama is the llama-cpp provider; the rest are
+# tuios' own integration extensions. A missing path is skipped, not fatal.
+PI_EXTENSIONS = [
+    "builtin:mcp",
+    "extensions/pure-agent.ts",
+    "extensions/tuios-agent-state.ts",
+]
+PI_LLAMA = "git/github.com/huggingface/pi-llama"
+
+
+def pi_isolation(entry: dict) -> list[str]:
+    wanted = list(PI_EXTENSIONS)
+    if entry.get("provider") == "llama-cpp":
+        wanted.append(PI_LLAMA)
+    args = ["--no-skills", "--no-extensions"]
+    for w in wanted:
+        if w.startswith("builtin:"):
+            args += ["--extension", w]
+            continue
+        p = agent_dir() / w
+        if p.exists():
+            args += ["--extension", str(p)]
+    return args
+
+
+def ensure_model_metadata(entry: dict) -> None:
+    """Keep the Rule's context_window (and a matching output cap) in
+    pi's model metadata (models.json)."""
+    provider, model = entry.get("provider", ""), entry.get("model", "")
+    ctx = entry.get("context_window")
+    if not (provider and model and ctx):
+        return
+    max_out = entry.get("max_tokens") or ctx
+    path = Path(os.environ.get("PI_MODELS", "~/.pi/agent/models.json")).expanduser()
+    try:
+        cfg = json.loads(path.read_text()) if path.exists() else {}
+    except ValueError:
+        print(f"skip context_window for {model}: {path} is not valid JSON")
+        return
+    over = (cfg.setdefault("providers", {}).setdefault(provider, {})
+               .setdefault("modelOverrides", {}).setdefault(model, {}))
+    if over.get("contextWindow") == ctx and over.get("maxTokens") == max_out:
+        return
+    over["contextWindow"] = ctx
+    over["maxTokens"] = max_out
+    print(f"+ {path}: providers.{provider}.modelOverrides[{model!r}] = "
+          f"{{contextWindow: {ctx}, maxTokens: {max_out}}}")
+    if not DRY:
+        path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+
+
+def agent_dir() -> Path:
+    return Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")).expanduser()
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+
+
+# Codex has no `--no-skills`/`--skill` pair: discovery is always on, from the
+# user's roots. The seat's allowlist is therefore the Rule's `skills` minus
+# every name codex would discover, switched off one by one with `skills.config`.
+def codex_skill_roots() -> list[Path]:
+    """The user roots codex discovers skills from, plus the repo's own."""
+    return [codex_home() / "skills", Path.home() / ".agents" / "skills",
+            ROOT / ".agents" / "skills"]
+
+
+def codex_skill_names() -> set[str]:
+    """Every skill name in the roots codex would discover skills from."""
+    names: set[str] = set()
+    for root in codex_skill_roots():
+        if not root.is_dir():
+            continue
+        for depth in ("*", "*/*"):
+            for md in root.glob(f"{depth}/SKILL.md"):
+                names.add(md.parent.name)
+    return names
+
+
+def ensure_codex_skill(name: str) -> None:
+    """Install a skill vendored at skills/<name>/ into codex's user root."""
+    src = ROOT / "skills" / name
+    if not (src / "SKILL.md").is_file():
+        die(f"no skill {name!r} vendored at {src}")
+    dest = codex_home() / "skills" / name
+    for f in src.rglob("*"):
+        if not f.is_file():
+            continue
+        target = dest / f.relative_to(src)
+        if DRY:
+            print(f"+ {target} <- {f}")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists() or target.read_bytes() != f.read_bytes():
+            target.write_bytes(f.read_bytes())
+            print(f"+ {target}")
+
+
+def toml_str(s: str) -> str:
+    """A TOML basic string. JSON escaping is a subset of TOML's, so reuse it."""
+    return json.dumps(s)
+
+
+def codex_skill_rules(issued: set[str]) -> str:
+    """The `[[skills.config]]` tables for a seat: disable every skill codex would
+    discover, then enable the issued names."""
+    blocks = []
+    for name in sorted(codex_skill_names() - issued):
+        blocks.append(f"[[skills.config]]\nname = {toml_str(name)}\nenabled = false")
+    for name in sorted(issued):
+        blocks.append(f"[[skills.config]]\nname = {toml_str(name)}\nenabled = true")
+    return "\n\n".join(blocks)
+
+
+def codex_profile_path(s: dict) -> Path:
+    """A seat's own codex config: `codex -p <name>` layers this over the base
+    user config.toml. Shared auth and state; its own instructions and skills."""
+    return codex_home() / f"{s.get('name', '')}.config.toml"
+
+
+def codex_profile_text(s: dict) -> str:
+    """The profile file for one codex seat, written from the Rule."""
+    for name in s.get("skills", []):
+        ensure_codex_skill(name)
+    brief = (ROOT / (s.get("brief") or "agents/seat.md")).read_text()
+    lines = ["# Written by demon-slayers from demon_slayers.py; edit the Rule, not this."]
+    if s.get("provider"):
+        lines.append(f"model_provider = {toml_str(s['provider'])}")
+    if s.get("model"):
+        lines.append(f"model = {toml_str(s['model'])}")
+    lines += [
+        "developer_instructions = " + toml_str(brief.strip() + "\n\n" + seat_identity(s)),
+        "project_doc_max_bytes = 0",     # no AGENTS.md, pi's --no-context-files
+        "",
+        "[skills.bundled]",
+        "enabled = false",
+    ]
+    rules = codex_skill_rules(set(s.get("skills", [])))
+    if rules:
+        lines += ["", rules]
+    return "\n".join(lines) + "\n"
+
+
+def ensure_codex_profile(s: dict) -> Path:
+    """Write the seat's codex profile, only when it drifts from the Rule."""
+    path = codex_profile_path(s)
+    text = codex_profile_text(s)
+    if DRY:
+        print(f"+ {path}")
+        return path
+    if not path.exists() or path.read_text() != text:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        print(f"+ {path}")
+    return path
+
+
+def codex_seat_args(s: dict) -> list[str]:
+    """The codex argv for a seat: its own profile, and trusted hooks."""
+    ensure_codex_profile(s)
+    # The hooks are tuios's own (`tuios integration install codex`); a seat is
+    # raised by automation with nobody to answer codex's hook-review prompt. The
+    # flag does it; `bypass_hook_trust` in the profile does not (checked).
+    return ["-p", s.get("name", ""), "--dangerously-bypass-hook-trust"]
+
+
+def agent_file(name: str, body: str, description: str, model: str = "",
+               tools: list[str] | None = None) -> Path:
+    """Write ~/.pi/agent/agents/<name>.md and return its path.
+
+    The file is the pi agent entry (that is the directory the subagent tooling
+    reads) and the agent's system prompt: pi replaces its default prompt with
+    `--system-prompt <path>`. Rewritten only when it drifts from the Rule.
+    """
+    front = [f"name: {name}", f"description: {json.dumps(description)}"]
+    if model:
+        front.append(f"model: {model}")
+    if tools:
+        front.append("tools: " + ", ".join(tools))
+    text = "---\n" + "\n".join(front) + "\n---\n\n" + body.strip() + "\n"
+    path = agent_dir() / "agents" / f"{name}.md"
+    if not DRY and (not path.exists() or path.read_text() != text):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        print(f"+ {path}")
+    return path
+
+
+def session_names() -> list[str]:
+    r = subprocess.run(["tuios", "ls", "--json"], capture_output=True, text=True)
+    try:
+        return [s["name"] for s in json.loads(r.stdout)]
+    except ValueError:
+        return []
+
+
+def workspaces(sess: str) -> list[dict]:
+    r = subprocess.run(["tuios", "list-workspaces", "-s", sess, "--json"],
+                       capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout).get("workspaces", [])
+    except ValueError:
+        return []
+
+
+def windows(sess: str) -> list[dict]:
+    r = subprocess.run(["tuios", "list-windows", "-s", sess, "--json"],
+                       capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout).get("windows", [])
+    except ValueError:
+        return []
+
+
+def current_window(sess: str) -> dict | None:
+    """The window this process runs in, when it runs inside tuios."""
+    wid = os.environ.get("TUIOS_WINDOW_ID")
+    if not wid:
+        return None
+    return next((w for w in windows(sess) if w.get("window_id") == wid), None)
+
+
+def in_master_workspace(cfg: dict, sess: str) -> bool:
+    """True when this process runs in the workspace named for the Master."""
+    if not inside_tuios():
+        return False
+    here = current_window(sess)
+    if here is None:
+        return False
+    wanted = cfg["session"].get("master_workspace", "master")
+    return any(int(w.get("workspace", -1)) == int(here.get("workspace", -2))
+               and w.get("name") == wanted for w in workspaces(sess))
+
+
+def ensure_setup(cfg: dict) -> None:
+    if not shutil.which("tuios"):
+        die("tuios is not on PATH")
+    run(["tuios", "integration", "install", "pi"], check=False)
+    if shutil.which("codex"):
+        run(["tuios", "integration", "install", "codex", "--mcp"], check=False)
+
+
+# --- the two sessions ---------------------------------------------------------
+
+def find_master_session(cfg: dict) -> str:
+    """The master session: the one carrying the master workspace."""
+    if inside_tuios():
+        return os.environ["TUIOS_SESSION"]
+    wanted = cfg["session"].get("master_workspace", "master")
+    for name in session_names():
+        if any(w.get("name") == wanted for w in workspaces(name)):
+            return name
+    return cfg["session"].get("master_name", "demon-slayers-master")
+
+
+def ensure_master_session(cfg: dict) -> str:
+    sess = find_master_session(cfg)
+    if sess not in session_names():
+        run(["tuios", "new", sess, "--detach"])
+    return sess
+
+
+def ensure_seat_session(cfg: dict) -> str:
+    """The seats share the Master's session; `seat_workspace` splits them off."""
+    return ensure_master_session(cfg)
+
+
+def ensure_workspace(sess: str, wanted: str, avoid: tuple[int, ...] = ()) -> int:
+    """Return the number of a workspace, naming a free empty one if needed.
+
+    A named workspace is never stolen for another name: the Master's workspace
+    can be empty while its pane is down, and must stay the Master's. `avoid`
+    keeps an already-claimed number out of the running.
+    """
+    spaces = workspaces(sess)
+    for w in spaces:
+        if w.get("name") == wanted:
+            return int(w["workspace"])
+    for unnamed in (True, False):
+        for w in spaces:
+            n = int(w["workspace"])
+            if w.get("window_count") or n in avoid:
+                continue
+            if unnamed and w.get("name"):
+                continue
+            run(["tuios", "set-workspace-name", "-s", sess, str(n), wanted], check=False)
+            return n
+    return 2
+
+
+def master_workspace(cfg: dict, sess: str) -> int:
+    return ensure_workspace(sess, cfg["session"].get("master_workspace", "master"))
+
+
+def seat_workspace(cfg: dict, sess: str, avoid: tuple[int, ...] = ()) -> int:
+    return ensure_workspace(sess, cfg["session"].get("seat_workspace", "demon-slayers"),
+                            avoid)
+
+
+# --- MCP ----------------------------------------------------------------------
+
+def listening(url: str) -> bool:
+    u = urllib.parse.urlparse(url)
+    try:
+        with socket.create_connection((u.hostname or "127.0.0.1", u.port or 80), 0.3):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_mcp(cfg: dict, name: str, sess: str, ws: int) -> None:
+    """Register an MCP server with pi, opening it in a pane if it is down."""
+    m = cfg.get("mcp", {}).get(name)
+    if m is None:
+        die(f"no mcp named {name!r}")
+    if m.get("start") and not listening(m.get("url", "")):
+        run(["tuios", "new-window", "-s", sess, name, "--workspace", str(ws),
+             "--"] + m["start"], check=False)
+        if not DRY:
+            time.sleep(1.5)
+    if not shutil.which("pi"):
+        return
+    cmd = ["pi", "mcp", "add", name]
+    if m.get("exposure"):
+        cmd += ["--exposure", m["exposure"]]
+    if m.get("url"):
+        cmd += ["--url", m["url"]]
+    if m.get("command"):
+        cmd += ["--"] + m["command"]
+    run(cmd, check=False)
+
+
+# --- raising panes ------------------------------------------------------------
+
+def roster(cfg: dict) -> str:
+    seat_workspace = cfg["session"].get("seat_workspace", "demon-slayers")
+    lines = [
+        "", "## The Demon Slayers — raised on demand", "",
+        "You keep no standing army. Every order goes through the `dispatch` tool:",
+        "name the seat and the order; it raises the seat if it is not already up,",
+        "asks it, and returns the report. The seat stays up for the next order.",
+        f"The seats live in this session, in the workspace `{seat_workspace}`.", "",
+        "| call them | character | tags | domain |", "|---|---|---|---|",
+    ]
+    for group in ("pillar", "slayers"):
+        for key, s in cfg.get(group, {}).items():
+            tags = ", ".join(s.get("tags", [])) or "—"
+            lines.append(f"| {s.get('name', key)} | {s['character']} | {tags} | {s['domain']} |")
+    lines += ["", "Give each order to one seat, by the name above.", ""]
+    return "\n".join(lines)
+
+
+def routing_path() -> Path:
+    """The routing table the Master's extension reads: seat tags + lexicon."""
+    return agent_dir() / "demon-slayers" / "routing.json"
+
+
+def routing_data(cfg: dict) -> dict:
+    seats = []
+    for group in ("pillar", "slayers"):
+        for s in cfg.get(group, {}).values():
+            seats.append({"name": s.get("name", ""), "character": s.get("character", ""),
+                          "domain": s.get("domain", ""), "tags": s.get("tags", [])})
+    return {"seats": seats, "lexicon": cfg.get("lexicon", {})}
+
+
+def write_routing(cfg: dict) -> Path:
+    """Write the Rule's tags and lexicon for the Master's router.
+
+    One source: the extension reads this, it does not keep its own copy. A tag
+    claimed by two seats is a real ambiguity, so say so here, at config time.
+    """
+    data = routing_data(cfg)
+    owners: dict[str, list[str]] = {}
+    for s in data["seats"]:
+        for tag in s["tags"]:
+            owners.setdefault(tag, []).append(s["name"])
+    for tag, names in sorted(owners.items()):
+        if len(names) > 1:
+            print(f"warning: tag {tag!r} is claimed by {', '.join(names)}; "
+                  f"orders matching it will ask which one")
+    path = routing_path()
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    if DRY:
+        print(f"+ {path}")
+        return path
+    if not path.exists() or path.read_text() != text:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        print(f"+ {path}")
+    return path
+
+
+# What a pane shows while an agent owns it. Adopting such a window would nest an
+# agent inside an agent, so `up` never does.
+AGENT_FOREGROUNDS = {"pi", "codex", "claude", "claude-code", "gemini", "opencode"}
+
+
+def master_command(cfg: dict, o: dict, sess: str, ws: int, seat_session: str) -> list[str]:
+    """Write the Master's agent file and return its pi argv, without a wrapper."""
+    ensure_mcp(cfg, "tuios", sess, ws)
+    ensure_model_metadata(o)
+    write_routing(cfg)
+    body = (ROOT / o["brief"]).read_text() + "\n" + roster(cfg)
+    entry = agent_file(
+        o["name"], body,
+        "the Master of the Demon Slayers: perceives, decides and dispatches; "
+        "no tool but the crows",
+        model=model_arg(o), tools=o["tools"],
+    )
+    argv = ["--tools", ",".join(o["tools"]), "--system-prompt", str(entry)]
+    if o.get("harness", "pi") == "pi":
+        argv += pi_isolation(o)
+        # AGENTS.md is the crew's design doc, not the Master's operating
+        # orders; the brief already carries the roster. Keep it out.
+        argv += ["--no-context-files"]
+        argv += ["--extension", str((ROOT / "extensions/slayer.ts").resolve())]
+        if model_arg(o):
+            argv += ["--model", model_arg(o)]
+    return argv
+
+
+def start_master(cfg: dict, sess: str, ws: int, seat_session: str) -> None:
+    o = cfg["master"]
+    argv = master_command(cfg, o, sess, ws, seat_session)
+    run(["tuios", "start-agent",
+         "-s", sess,
+         "--name", o["name"],
+         "--cwd", cwd(cfg),
+         "--workspace", str(ws),
+         "--grants", ",".join(o.get("grants", [])),
+         "--env", f"DEMON_SLAYERS_LAUNCHER={str((ROOT / 'demon-slayers').resolve())}",
+         "--env", f"DEMON_SLAYERS_SEAT_SESSION={seat_session}",
+         "--env", f"DEMON_SLAYERS_ROUTING={routing_path()}",
+         o.get("harness", "pi"),
+         "--"] + argv)
+
+
+def adopt_current_window(cfg: dict, sess: str, ws: int, seat_session: str) -> bool:
+    """Become the Master in this window rather than raising a new pane.
+
+    Only when this process runs inside the Master's own workspace and is not
+    already an agent. Takes the Master's grants; a pane that cannot grant
+    itself admin gives up, so the caller raises a pane instead.
+    """
+    o = cfg["master"]
+    here = current_window(sess)
+    if here is None:
+        return False
+    if here.get("foreground_cmd") in AGENT_FOREGROUNDS:
+        return False
+    wid = here["window_id"]
+    r = run(["tuios", "set-pane-grants", "-w", wid,
+             "--grants", ",".join(o.get("grants", []))], check=False)
+    if r.returncode != 0:
+        print(f"this pane cannot hold the Master's grants "
+              f"({','.join(o.get('grants', []))}); raising a pane instead")
+        return False
+    # One Master: retire any other window already wearing the name.
+    for w in windows(sess):
+        if w.get("display_name") == o["name"] and w.get("window_id") != wid:
+            close_window(sess, w["window_id"])
+    argv = master_command(cfg, o, sess, ws, seat_session)
+    run(["tuios", "set-window", "-s", sess, "-w", wid, "--name", o["name"]], check=False)
+    try:
+        os.chdir(cwd(cfg))
+    except OSError:
+        pass
+    env = dict(os.environ)
+    env["DEMON_SLAYERS_LAUNCHER"] = str((ROOT / "demon-slayers").resolve())
+    env["DEMON_SLAYERS_SEAT_SESSION"] = seat_session
+    env["DEMON_SLAYERS_ROUTING"] = str(routing_path())
+    print(f"the Master takes this window (name {o['name']!r}); the seats are "
+          f"called up on demand")
+    if DRY:
+        return True
+    os.execvpe(o.get("harness", "pi"), [o.get("harness", "pi")] + argv, env)
+    return True  # unreachable
+
+
+def find_seat(cfg: dict, key: str) -> tuple[str, dict] | None:
+    for group in ("pillar", "slayers"):
+        for k, s in cfg.get(group, {}).items():
+            if k == key or s.get("name") == key:
+                return group, s
+    return None
+
+
+def start_seat(cfg: dict, key: str, sess: str, ws: int, desc: str = "") -> str:
+    found = find_seat(cfg, key)
+    if found is None:
+        die(f"no seat named {key!r}")
+    group, s = found
+    harness = s.get("harness", "pi")
+    if not shutil.which(harness) and not DRY:
+        print(f"skip {key}: {harness} is not installed")
+        return ""
+    for mcp in s.get("mcps", []):
+        ensure_mcp(cfg, mcp, sess, ws)
+    role = s.get("name", key)
+    # A task is a window: its 8-hex id is the address, its role and description
+    # live in the pane's agent meta. One order, one task, one context.
+    task = secrets.token_hex(4)
+    if harness == "pi":
+        ensure_model_metadata(s)
+    extra: list[str] = []
+    if harness == "pi":
+        extra += pi_isolation(s)
+        extra += ["--system-prompt", str(seat_agent_file(s))]
+        if model_arg(s):
+            extra += ["--model", model_arg(s)]
+        for skill in s.get("skills", []):
+            extra += ["--skill", skill]
+        # A seat may narrow its own tools (the scout is read-only) and load a
+        # seat-only extension (the scout's web tools and write guard).
+        if s.get("tools"):
+            extra += ["--tools", ",".join(s["tools"])]
+        for ext in s.get("extensions", []):
+            extra += ["--extension", str((ROOT / ext).resolve())]
+    elif harness == "codex":
+        extra += codex_seat_args(s)
+    elif s.get("model"):
+        extra += ["--model", s["model"]]
+    args = ["tuios", "start-agent",
+            "-s", sess,
+            "--name", task,
+            "--cwd", cwd(cfg),
+            "--workspace", str(ws),
+            "--grants", ",".join(s.get("grants", ["read", "write", "fan"])),
+            harness]
+    if extra:
+        args += ["--"] + extra
+    run(args)
+    set_task_meta(sess, task, role, desc)
+    print(f"task={task}")
+    return task
+
+
+def set_task_meta(sess: str, task: str, role: str, desc: str) -> None:
+    """Record the task's role and description on its pane (tuios agent meta)."""
+    one_line = " ".join(desc.split())[:80]
+    args = ["tuios", "set-agent-meta", "-s", sess, "-w", task,
+            f"task={task}", f"role={role}"]
+    if one_line:
+        args.append(f"desc={one_line}")
+    args += ["--source", "demon-slayers"]
+    run(args, check=False)
+
+
+def seat_identity(s: dict) -> str:
+    name = s.get("name", "")
+    # Every seat's system prompt ends here, so the one standing order that is not
+    # domain-specific lives here: answer short.
+    concise = (" Answer in the fewest lines that carry the answer: no preamble, no "
+               "restating the order, no follow-up questions you were not asked.")
+    role = s.get("role") or s.get("domain", "")
+    prefix = f"Role: {role}. " if role and role != s.get("domain") else ""
+    return (f"You are {s['character']}, seat {name}. {prefix}"
+            f"Domain: {s['domain']}." + concise)
+
+
+def seat_agent_file(s: dict) -> Path:
+    """The seat's ~/.pi/agent/agents entry, and the seat's system prompt."""
+    brief = (ROOT / (s.get("brief") or "agents/seat.md")).read_text()
+    return agent_file(s.get("name"), brief + "\n\n" + seat_identity(s),
+                      description=s.get("domain", ""), model=model_arg(s),
+                      tools=s.get("tools"))
+
+
+def prepare_seats(cfg: dict, sess: str, ws: int) -> None:
+    """Register every seat: MCPs, model metadata and its agents entry.
+
+    Raise none of them: `up` leaves every seat on demand.
+    """
+    for group in ("pillar", "slayers"):
+        for key, s in cfg.get(group, {}).items():
+            if s.get("harness", "pi") == "pi":
+                ensure_model_metadata(s)
+                seat_agent_file(s)
+            elif s.get("harness") == "codex":
+                ensure_codex_profile(s)
+            for mcp in s.get("mcps", []):
+                ensure_mcp(cfg, mcp, sess, ws)
+
+
+def up(cfg: dict) -> None:
+    ensure_setup(cfg)
+    msess = ensure_master_session(cfg)
+    ssess = ensure_seat_session(cfg)
+    mws = master_workspace(cfg, msess)
+    sws = seat_workspace(cfg, ssess, (mws,))
+    prepare_seats(cfg, ssess, sws)
+    # Running `up` from a shell in the Master's own workspace: that window
+    # becomes the Master, so no second pane appears beside it.
+    if in_master_workspace(cfg, msess) and adopt_current_window(cfg, msess, mws, ssess):
+        return
+    start_master(cfg, msess, mws, ssess)
+    if inside_tuios():
+        run(["tuios", "select-workspace", "-s", msess, str(mws)], check=False)
+    where = "" if inside_tuios() else f" Attach: tuios attach {msess}"
+    print(f"\nThe Master is raised in session {msess!r} (workspace {mws}); the "
+          f"seats, in session {ssess!r} (workspace {sws}), are called up on "
+          f"demand by the Master's `dispatch`.{where}")
+
+
+# --- taking it down -----------------------------------------------------------
+
+def close_window(sess: str, window_id: str) -> None:
+    run(["tuios", "run-command", "-s", sess, "CloseWindow", window_id], check=False)
+
+
+def agents(sess: str) -> list[dict]:
+    """The agent panes of a session, as tuios reports them."""
+    r = subprocess.run(["tuios", "list-agents", "-s", sess, "--json"],
+                       capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout).get("agents", [])
+    except ValueError:
+        return []
+
+
+def task_of(a: dict) -> str:
+    return (a.get("meta") or {}).get("task", "")
+
+
+def close_crew(cfg: dict, sess: str) -> None:
+    """Close the Master and every task window (tasks are named by task id now)."""
+    master = cfg["master"].get("name", "master")
+    for a in agents(sess):
+        if task_of(a) or a.get("name") == master:
+            close_window(sess, a["window_id"])
+    panes = {n for n, m in cfg.get("mcp", {}).items() if m.get("start")}
+    r = subprocess.run(["tuios", "list-windows", "-s", sess, "--json"],
+                       capture_output=True, text=True)
+    try:
+        windows = json.loads(r.stdout).get("windows", [])
+    except ValueError:
+        windows = []
+    for w in windows:
+        if (w.get("display_name") or w.get("title") or "") in panes:
+            close_window(sess, w["window_id"])
+
+
+def down(cfg: dict) -> None:
+    """Close the crew: the Master pane and every seat, all in one session."""
+    msess = find_master_session(cfg)
+    # Retire a session from the old layout, when seats ran in their own session.
+    legacy = cfg["session"].get("seat_workspace", "demon-slayers")
+    if legacy != msess and legacy in session_names():
+        run(["tuios", "kill-session", legacy], check=False)
+    if inside_tuios():
+        close_crew(cfg, msess)                             # master, seats, MCP panes
+    else:
+        run(["tuios", "kill-session", msess], check=False)
+
+
+# tuios reports working/idle/needs_input/done/errored; the crew speaks its own.
+STATE_WORDS = {"working": "hunting", "idle": "at rest", "done": "at rest",
+               "needs_input": "needs you", "errored": "errored",
+               "unknown": "unknown", "none": "at rest"}
+
+TASK_COLUMNS = (("TASK", "task"), ("ROLE", "role"), ("STATE", "state"),
+                ("HARNESS", "harness"), ("DESC", "desc"))
+
+
+def print_table(columns: tuple, rows: list[dict]) -> None:
+    """columns is (header, key) pairs; rows are dicts."""
+    def value(r: dict, k: str) -> str:
+        v = r.get(k, "")
+        if isinstance(v, list):
+            v = ", ".join(v)
+        return str(v) or "-"
+    widths = [max(len(h), *(len(value(r, k)) for r in rows)) for h, k in columns]
+    for (header, _), w in zip(columns, widths):
+        print(header.ljust(w), end="  ")
+    print()
+    for r in rows:
+        for (_, k), w in zip(columns, widths):
+            print(value(r, k).ljust(w), end="  ")
+        print()
+
+
+def task_rows(sess: str) -> list[dict]:
+    """Every task window in the session, from its agent meta."""
+    rows = []
+    for a in agents(sess):
+        meta = a.get("meta") or {}
+        if not meta.get("task"):
+            continue
+        rows.append({
+            "task": meta.get("task", a.get("name", "")),
+            "role": meta.get("role", ""),
+            "state": STATE_WORDS.get(a.get("state", ""), a.get("state", "")),
+            "harness": a.get("harness_id", ""),
+            "desc": meta.get("desc", ""),
+        })
+    return rows
+
+
+def status(cfg: dict) -> None:
+    """Every task in the crew: its id, role, state and one-line description."""
+    rows = task_rows(find_master_session(cfg))
+    if not rows:
+        print("no tasks. order something in the master pane, or "
+              "`demon-slayers task --to <name> --desc <text>`.")
+        return
+    print_table(TASK_COLUMNS, rows)
+
+
+def end_task(cfg: dict, task: str) -> None:
+    """Close one task's window: its context goes with it."""
+    sess = find_master_session(cfg)
+    for a in agents(sess):
+        if task_of(a) == task or a.get("name") == task:
+            close_window(sess, a["window_id"])
+            print(f"ended {task}")
+            return
+    die(f"no task {task!r}")
+
+
+def end_idle(cfg: dict) -> None:
+    """Close every task window that is idle or done; leave the rest."""
+    sess = find_master_session(cfg)
+    ended = 0
+    for a in agents(sess):
+        if task_of(a) and a.get("state") in ("idle", "done"):
+            close_window(sess, a["window_id"])
+            print(f"ended {task_of(a)} ({(a.get('meta') or {}).get('role', '')})")
+            ended += 1
+    print(f"{ended} task(s) ended")
+
+
+def codex_model(s: dict) -> str:
+    """A codex seat's effective model: its own profile, else the base config."""
+    for path in (codex_profile_path(s), codex_home() / "config.toml"):
+        try:
+            cfg = tomllib.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        provider, model = cfg.get("model_provider", ""), cfg.get("model", "")
+        if provider and model:
+            return f"{provider}/{model}"
+        if model:
+            return model
+    return "codex default"
+
+
+def seat_model(s: dict) -> str:
+    """The Rule's provider/model, or a codex seat's inherited config default."""
+    if s.get("provider") and s.get("model"):
+        return f"{s['provider']}/{s['model']}"
+    if s.get("model"):
+        return s["model"]
+    if s.get("harness") == "codex":
+        return codex_model(s)
+    return "harness default"
+
+
+def crew(cfg: dict) -> list[dict]:
+    """The Master and every seat, in roster order."""
+    return [cfg["master"], *cfg.get("pillar", {}).values(),
+            *cfg.get("slayers", {}).values()]
+
+
+def seat_record(s: dict) -> dict:
+    """One seat's specs, straight from the Rule."""
+    return {
+        "name": s.get("name", ""),
+        "character": s.get("character", ""),
+        "domain": s.get("domain", ""),
+        "tags": s.get("tags", []),
+        "harness": s.get("harness", "pi"),
+        "model": seat_model(s),
+        "skills": s.get("skills", []),
+        "mcps": s.get("mcps", []),
+        "tools": s.get("tools", []),
+        "grants": s.get("grants", []),
+        "extensions": s.get("extensions", []),
+        "brief": s.get("brief", ""),
+    }
+
+
+INFO_FIELDS = ("name", "character", "domain", "tags", "harness", "model",
+               "skills", "mcps", "tools", "grants", "extensions", "brief")
+INFO_COLUMNS = (("NAME", "name"), ("HARNESS", "harness"), ("MODEL", "model"),
+                ("SKILLS", "skills"), ("TAGS", "tags"), ("MCPS", "mcps"))
+
+
+def cell(record: dict, key: str) -> str:
+    v = record[key]
+    if isinstance(v, list):
+        return ", ".join(v) or "-"
+    return str(v) or "-"
+
+
+def info(cfg: dict, args: list[str]) -> None:
+    """What each seat is: the specs — harness, model, tags, skills, MCPs."""
+    records = [seat_record(s) for s in crew(cfg)]
+    if "--json" in args:
+        print(json.dumps(records, indent=2, ensure_ascii=False))
+        return
+    names = [a for a in args if not a.startswith("-")]
+    if names:
+        found = next((r for r in records
+                      if names[0].lower() in (r["name"].lower(), r["character"].lower())),
+                     None)
+        if found is None:
+            die(f"no seat named {names[0]!r}")
+        for key in INFO_FIELDS:
+            print(f"{key:<11}{cell(found, key)}")
+        return
+    print_table(INFO_COLUMNS, records)
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else "help"
+    if cmd in ("help", "-h", "--help"):
+        print(__doc__)
+        return
+    cfg = rule()
+    if cmd == "up":
+        if len(argv) > 1:
+            die("up takes no arguments; raise a task with "
+                "`demon-slayers task --to <name> --desc <text>`")
+        up(cfg)
+    elif cmd == "task":
+        role, desc = "", ""
+        rest = argv[1:]
+        while rest:
+            if rest[0] == "--to" and len(rest) > 1:
+                role, rest = rest[1], rest[2:]
+            elif rest[0] == "--desc" and len(rest) > 1:
+                desc, rest = rest[1], rest[2:]
+            else:
+                die(f"task: unexpected argument {rest[0]!r}; "
+                    f"use --to <name> --desc <text>")
+        if not role:
+            die("task needs --to <name>")
+        ensure_setup(cfg)
+        ssess = ensure_seat_session(cfg)
+        start_seat(cfg, role, ssess, seat_workspace(cfg, ssess), desc)
+    elif cmd == "status":
+        status(cfg)
+    elif cmd == "info":
+        info(cfg, argv[1:])
+    elif cmd == "end":
+        if len(argv) < 2:
+            die("end needs a task id")
+        end_task(cfg, argv[1])
+    elif cmd == "end-idle":
+        end_idle(cfg)
+    elif cmd == "attach":
+        run(["tuios", "attach", find_master_session(cfg)])
+    elif cmd == "down":
+        down(cfg)
+    else:
+        die(f"unknown command {cmd!r}; try: up | task | status | info | end | "
+            f"end-idle | attach | down")
+
+
+if __name__ == "__main__":
+    main()
